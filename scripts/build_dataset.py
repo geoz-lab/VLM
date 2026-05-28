@@ -16,9 +16,9 @@ Run:
     --train_ratio 0.7 --val_ratio 0.15
 """
 
+import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 import json
-import os
 import random
 from pathlib import Path
 
@@ -42,9 +42,7 @@ def process_annotated_video(
     context_frames: int = 3,
     max_anomaly_frames: int = 5,
 ) -> list[dict]:
-    """
-    Process one annotated video and return a list of JSONL records.
-    """
+    """Process one annotated video and return a list of JSONL records."""
     video_path = annotation["video_path"]
     true_injections = annotation.get("injections", [])
     is_clean = annotation["label"] == "clean"

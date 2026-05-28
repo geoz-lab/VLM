@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Generated data (large binaries — regenerate locally)
+data/raw_videos/
+data/ad_frames/
+data/synthetic/videos/
+data/synthetic/annotations/
+data/dataset/train/
+data/dataset/val/
+data/dataset/test/
+
+# Keep dataset directory structure
+!data/raw_videos/.gitkeep
+!data/ad_frames/.gitkeep
+!data/synthetic/videos/.gitkeep
+!data/synthetic/annotations/.gitkeep
+!data/dataset/train/.gitkeep
+!data/dataset/val/.gitkeep
+!data/dataset/test/.gitkeep
+
+# Model weights (large)
+models/
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Reports output
+reports/
+
+# Pipeline temp files
+*.processed
+video_input/*.mp4
+video_input/*.avi
+video_input/*.mov
+video_input/*.mkv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+wandb/
+runs/

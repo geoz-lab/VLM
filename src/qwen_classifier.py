@@ -13,8 +13,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-import torch
-
 
 @dataclass
 class ClassifierOutput:
@@ -112,11 +110,31 @@ def _parse_response(raw: str) -> ClassifierOutput:
         )
 
 
+def _is_adapter_path(model_path: str) -> bool:
+    """True if path contains a LoRA adapter (has adapter_config.json)."""
+    import os
+    return os.path.exists(os.path.join(model_path, "adapter_config.json"))
+
+
+def _is_merged_path(model_path: str) -> bool:
+    """True if path looks like a fully merged HF model (has config.json, no adapter_config)."""
+    import os
+    return (
+        os.path.exists(os.path.join(model_path, "config.json"))
+        and not os.path.exists(os.path.join(model_path, "adapter_config.json"))
+    )
+
+
 class QwenVLClassifier:
     """
     Wrapper around Qwen2.5-VL-7B-Instruct for ad insertion classification.
 
-    Lazy-loads model on first call to avoid slow import at startup.
+    Supports three loading modes (auto-detected from model_path):
+      1. HuggingFace Hub ID (e.g. "Qwen/Qwen2.5-VL-7B-Instruct") → base model
+      2. Local LoRA adapter dir (contains adapter_config.json) → base + adapter
+      3. Local merged model dir (contains config.json, no adapter) → merged model
+
+    Lazy-loads on first classify() call.
     """
 
     def __init__(
@@ -137,13 +155,26 @@ class QwenVLClassifier:
         if self._model is not None:
             return
 
+        import json as _json
+        import os
+        import torch
         from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
         from qwen_vl_utils import process_vision_info
 
-        print(f"[QwenVLClassifier] Loading model from: {self.model_path}")
+        is_adapter = _is_adapter_path(self.model_path)
+        is_merged  = _is_merged_path(self.model_path)
+
+        if is_adapter:
+            # Load base model name from adapter config
+            with open(os.path.join(self.model_path, "adapter_config.json")) as f:
+                base_name = _json.load(f)["base_model_name_or_path"]
+            print(f"[QwenVLClassifier] Adapter detected. Base: {base_name}, Adapter: {self.model_path}")
+        else:
+            base_name = self.model_path
+            print(f"[QwenVLClassifier] Loading {'merged' if is_merged else 'base'} model: {base_name}")
 
         quantization_config = None
-        if self.use_4bit:
+        if self.use_4bit and not is_merged:
             quantization_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=torch.bfloat16,
@@ -151,21 +182,41 @@ class QwenVLClassifier:
                 bnb_4bit_use_double_quant=True,
             )
 
-        self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            self.model_path,
-            torch_dtype=torch.bfloat16 if not self.use_4bit else None,
+        base_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            base_name,
+            torch_dtype=torch.bfloat16,
             quantization_config=quantization_config,
             device_map="auto",
+            attn_implementation="flash_attention_2" if self._flash_attn_available() else "eager",
         )
+
+        if is_adapter:
+            from peft import PeftModel
+            print("[QwenVLClassifier] Loading LoRA adapter...")
+            self._model = PeftModel.from_pretrained(base_model, self.model_path)
+        else:
+            self._model = base_model
+
         self._model.eval()
 
+        # Processor: prefer adapter dir (has custom config), else base
+        proc_path = self.model_path if (is_adapter or is_merged) else base_name
         self._processor = AutoProcessor.from_pretrained(
-            self.model_path,
+            proc_path,
             min_pixels=256 * 28 * 28,
             max_pixels=1280 * 28 * 28,
         )
         self._process_vision_info = process_vision_info
-        print("[QwenVLClassifier] Model loaded.")
+        mode = "adapter" if is_adapter else ("merged" if is_merged else "base")
+        print(f"[QwenVLClassifier] Model loaded ({mode}).")
+
+    @staticmethod
+    def _flash_attn_available() -> bool:
+        try:
+            import flash_attn  # noqa
+            return True
+        except ImportError:
+            return False
 
     def classify(
         self,
@@ -208,6 +259,7 @@ class QwenVLClassifier:
             return_tensors="pt",
         ).to(self._model.device)
 
+        import torch
         with torch.no_grad():
             output_ids = self._model.generate(
                 **inputs,

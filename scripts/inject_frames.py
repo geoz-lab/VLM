@@ -16,6 +16,7 @@ Run:
     --injections_per_video 3
 """
 
+import sys; sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.dirname(__import__('os').path.abspath(__file__))))
 import argparse
 import json
 import os

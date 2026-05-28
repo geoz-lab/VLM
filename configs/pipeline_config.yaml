@@ -43,4 +43,4 @@ report:
   output_dir: "./reports"
   include_contact_sheets: true
   include_timeline_plot: true
-  format: "html"              # html | json | both
+  format: "html,json"         # html | json | html,json

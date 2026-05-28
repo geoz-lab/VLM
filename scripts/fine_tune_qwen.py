@@ -1,155 +1,282 @@
 """
 Fine-tune Qwen2.5-VL-7B-Instruct on the ad-insertion detection dataset.
 
-Uses QLoRA (4-bit) + PEFT LoRA via the TRL SFTTrainer.
+Supports three GPU tiers:
+  --gpu_tier a100   → bf16 + LoRA r=64, no quantization (A100/H100 80GB)
+  --gpu_tier a100_4bit → QLoRA 4-bit + LoRA r=16  (A100 40GB or multi-GPU)
+  --gpu_tier h100   → bf16 + LoRA r=128 + flash_attention_2 (H100 80GB)
+
+Multi-GPU (DDP or DeepSpeed ZeRO-3):
+  Single node, 2× A100:
+    torchrun --nproc_per_node=2 scripts/fine_tune_qwen.py --gpu_tier a100
+
+  With DeepSpeed ZeRO-3:
+    deepspeed --num_gpus=2 scripts/fine_tune_qwen.py \
+      --gpu_tier a100 --deepspeed configs/deepspeed_zero3.json
 
 Run:
-  python scripts/fine_tune_qwen.py \
-    --config configs/training_config.yaml \
-    [--resume_from_checkpoint models/qwen_ad_detector/checkpoint-200]
+  python scripts/fine_tune_qwen.py --gpu_tier a100
+  python scripts/fine_tune_qwen.py --gpu_tier a100 --resume_from_checkpoint models/qwen_ad_detector/checkpoint-100
 """
 
 import argparse
 import json
 import os
+import sys
 
+import numpy as np
 import torch
 import yaml
-from datasets import Dataset
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from transformers import (
-    AutoProcessor,
-    BitsAndBytesConfig,
-    Qwen2_5_VLForConditionalGeneration,
-    TrainingArguments,
-)
-from trl import SFTConfig, SFTTrainer
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+
+# ── GPU tier presets ──────────────────────────────────────────────────────────
+
+GPU_TIERS = {
+    "a100": dict(
+        use_4bit=False,
+        lora_r=64,
+        lora_alpha=128,
+        per_device_batch=2,
+        gradient_accumulation=4,   # effective batch = 8
+        flash_attn=True,
+        dtype=torch.bfloat16,
+        desc="A100 80GB / H100 80GB — bf16, LoRA r=64",
+    ),
+    "a100_4bit": dict(
+        use_4bit=True,
+        lora_r=16,
+        lora_alpha=32,
+        per_device_batch=1,
+        gradient_accumulation=8,   # effective batch = 8
+        flash_attn=True,
+        dtype=torch.bfloat16,
+        desc="A100 40GB / multi-GPU — QLoRA 4-bit, LoRA r=16",
+    ),
+    "h100": dict(
+        use_4bit=False,
+        lora_r=128,
+        lora_alpha=256,
+        per_device_batch=4,
+        gradient_accumulation=2,   # effective batch = 8
+        flash_attn=True,
+        dtype=torch.bfloat16,
+        desc="H100 80GB — bf16, LoRA r=128",
+    ),
+}
+
+
+# ── Dataset utilities ─────────────────────────────────────────────────────────
 
 def load_jsonl(path: str) -> list[dict]:
     with open(path) as f:
         return [json.loads(line) for line in f if line.strip()]
 
 
-def preprocess_sample(sample: dict, processor, max_seq_length: int):
-    """
-    Convert a JSONL record into model inputs.
-    The record's messages follow OpenAI-style chat format with image content blocks.
-    """
+def collate_fn(batch):
+    """Remove None values for DataLoader compatibility."""
+    result = {}
+    for key in batch[0]:
+        vals = [b[key] for b in batch if b.get(key) is not None]
+        if vals and isinstance(vals[0], torch.Tensor):
+            result[key] = torch.stack(vals)
+    return result
+
+
+def build_hf_dataset(jsonl_path: str, processor, max_seq_length: int):
+    from datasets import Dataset
     from qwen_vl_utils import process_vision_info
 
-    messages = sample["messages"]
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-    image_inputs, video_inputs = process_vision_info(messages)
-
-    inputs = processor(
-        text=[text],
-        images=image_inputs if image_inputs else None,
-        videos=video_inputs if video_inputs else None,
-        padding=True,
-        truncation=True,
-        max_length=max_seq_length,
-        return_tensors="pt",
-    )
-    # Mask loss on everything except the assistant response
-    input_ids = inputs["input_ids"].squeeze(0)
-    labels = input_ids.clone()
-
-    # Find where the assistant turn starts
-    # Apply loss masking: set labels=-100 for system+user tokens
-    assistant_token = processor.tokenizer.encode("<|im_start|>assistant", add_special_tokens=False)
-    seq = input_ids.tolist()
-    for start_idx in range(len(seq) - len(assistant_token)):
-        if seq[start_idx: start_idx + len(assistant_token)] == assistant_token:
-            labels[:start_idx + len(assistant_token)] = -100
-            break
-    else:
-        labels[:] = -100  # fallback: mask all
-
-    return {
-        "input_ids": input_ids,
-        "attention_mask": inputs["attention_mask"].squeeze(0),
-        "pixel_values": inputs.get("pixel_values"),
-        "image_grid_thw": inputs.get("image_grid_thw"),
-        "labels": labels,
-    }
-
-
-def build_hf_dataset(jsonl_path: str, processor, max_seq_length: int) -> Dataset:
     records = load_jsonl(jsonl_path)
     processed = []
+
     for rec in records:
+        messages = rec["messages"]
         try:
-            processed.append(preprocess_sample(rec, processor, max_seq_length))
+            text = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False
+            )
+            image_inputs, video_inputs = process_vision_info(messages)
+            inputs = processor(
+                text=[text],
+                images=image_inputs if image_inputs else None,
+                videos=video_inputs if video_inputs else None,
+                padding=True,
+                truncation=True,
+                max_length=max_seq_length,
+                return_tensors="pt",
+            )
+
+            input_ids = inputs["input_ids"].squeeze(0)
+            labels = input_ids.clone()
+
+            # Mask loss on system + user tokens; only train on assistant response
+            assistant_tokens = processor.tokenizer.encode(
+                "<|im_start|>assistant", add_special_tokens=False
+            )
+            seq = input_ids.tolist()
+            for start_idx in range(len(seq) - len(assistant_tokens)):
+                if seq[start_idx: start_idx + len(assistant_tokens)] == assistant_tokens:
+                    labels[:start_idx + len(assistant_tokens)] = -100
+                    break
+            else:
+                labels[:] = -100
+
+            sample = {
+                "input_ids": input_ids,
+                "attention_mask": inputs["attention_mask"].squeeze(0),
+                "labels": labels,
+            }
+            if inputs.get("pixel_values") is not None:
+                sample["pixel_values"] = inputs["pixel_values"].squeeze(0)
+            if inputs.get("image_grid_thw") is not None:
+                sample["image_grid_thw"] = inputs["image_grid_thw"].squeeze(0)
+
+            processed.append(sample)
         except Exception as e:
-            print(f"  Skipping sample: {e}")
+            print(f"  Skipping sample (error: {e})")
+
     return Dataset.from_list(processed)
 
+
+# ── Evaluation metrics ────────────────────────────────────────────────────────
+
+def compute_metrics(eval_pred, processor):
+    """
+    Compute precision/recall/F1 on structured JSON predictions.
+    Called by Trainer after each eval step.
+    """
+    predictions, labels = eval_pred
+
+    # Decode predictions
+    if isinstance(predictions, tuple):
+        predictions = predictions[0]
+
+    # Replace -100 in labels (masked tokens)
+    labels = np.where(labels != -100, labels, processor.tokenizer.pad_token_id)
+
+    decoded_preds = processor.tokenizer.batch_decode(predictions, skip_special_tokens=True)
+    decoded_labels = processor.tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+    tp = fp = fn = 0
+    for pred_text, label_text in zip(decoded_preds, decoded_labels):
+        pred_label = _extract_label(pred_text)
+        true_label = _extract_label(label_text)
+        if true_label == "ad_insertion":
+            if pred_label == "ad_insertion":
+                tp += 1
+            else:
+                fn += 1
+        else:
+            if pred_label == "ad_insertion":
+                fp += 1
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    return {"precision": precision, "recall": recall, "f1": f1}
+
+
+def _extract_label(text: str) -> str:
+    import re, json as _json
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    try:
+        return _json.loads(text).get("label", "normal")
+    except Exception:
+        match = re.search(r'"label"\s*:\s*"(\w+)"', text)
+        return match.group(1) if match else "normal"
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/training_config.yaml")
+    parser.add_argument("--gpu_tier", choices=list(GPU_TIERS), default="a100")
     parser.add_argument("--resume_from_checkpoint", default=None)
+    parser.add_argument("--deepspeed", default=None, help="Path to DeepSpeed config JSON")
     args = parser.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    mc = cfg["model"]
-    lc = cfg["lora"]
+    tier = GPU_TIERS[args.gpu_tier]
+    print(f"GPU tier: {args.gpu_tier} — {tier['desc']}")
+
     tc = cfg["training"]
     dc = cfg["dataset"]
 
-    # ── Quantization config ────────────────────────────────────────────────
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=mc["use_4bit"],
-        bnb_4bit_compute_dtype=getattr(torch, mc["bnb_4bit_compute_dtype"]),
-        bnb_4bit_quant_type=mc["bnb_4bit_quant_type"],
-        bnb_4bit_use_double_quant=mc["use_nested_quant"],
-    ) if mc["use_4bit"] else None
+    # ── Quantization ─────────────────────────────────────────────────────────
+    bnb_config = None
+    if tier["use_4bit"]:
+        from transformers import BitsAndBytesConfig
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=tier["dtype"],
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
 
-    # ── Load model ─────────────────────────────────────────────────────────
-    print(f"Loading model: {mc['name']}")
+    # ── Load model ───────────────────────────────────────────────────────────
+    model_name = cfg["model"]["name"]
+    print(f"Loading model: {model_name}")
+
+    attn_impl = "flash_attention_2" if tier["flash_attn"] else "eager"
+    from transformers import Qwen2_5_VLForConditionalGeneration
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        mc["name"],
+        model_name,
         quantization_config=bnb_config,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
+        torch_dtype=tier["dtype"] if not tier["use_4bit"] else None,
+        attn_implementation=attn_impl,
+        device_map="auto" if not args.deepspeed else None,
     )
-    model = prepare_model_for_kbit_training(model)
 
-    # ── LoRA ───────────────────────────────────────────────────────────────
-    target_modules = lc["target_modules"] + lc.get("vision_modules", [])
+    if tier["use_4bit"]:
+        from peft import prepare_model_for_kbit_training
+        model = prepare_model_for_kbit_training(model)
+
+    # ── LoRA ─────────────────────────────────────────────────────────────────
+    from peft import LoraConfig, get_peft_model
+    lc = cfg["lora"]
     lora_config = LoraConfig(
-        r=lc["r"],
-        lora_alpha=lc["alpha"],
+        r=tier["lora_r"],
+        lora_alpha=tier["lora_alpha"],
         lora_dropout=lc["dropout"],
-        target_modules=target_modules,
+        target_modules=lc["target_modules"] + lc.get("vision_modules", []),
         bias="none",
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    # ── Processor ─────────────────────────────────────────────────────────
+    # ── Processor ────────────────────────────────────────────────────────────
+    from transformers import AutoProcessor
     processor = AutoProcessor.from_pretrained(
-        mc["name"],
+        model_name,
         min_pixels=256 * 28 * 28,
         max_pixels=dc.get("image_max_pixels", 1003520),
     )
 
-    # ── Dataset ───────────────────────────────────────────────────────────
-    print("Loading datasets...")
-    train_dataset = build_hf_dataset(dc["train_file"], processor, dc["max_seq_length"])
-    eval_dataset = build_hf_dataset(dc["val_file"], processor, dc["max_seq_length"])
-    print(f"  Train: {len(train_dataset)}  |  Val: {len(eval_dataset)}")
+    # ── Datasets ─────────────────────────────────────────────────────────────
+    print("Building datasets...")
+    train_ds = build_hf_dataset(dc["train_file"], processor, dc["max_seq_length"])
+    eval_ds = build_hf_dataset(dc["val_file"], processor, dc["max_seq_length"])
+    print(f"  Train: {len(train_ds)}  |  Val: {len(eval_ds)}")
 
-    # ── Trainer ───────────────────────────────────────────────────────────
-    training_args = SFTConfig(
-        output_dir=tc["output_dir"],
+    # ── Training args ────────────────────────────────────────────────────────
+    from transformers import TrainingArguments
+    output_dir = tc["output_dir"]
+
+    training_args = TrainingArguments(
+        output_dir=output_dir,
         num_train_epochs=tc["num_train_epochs"],
-        per_device_train_batch_size=tc["per_device_train_batch_size"],
-        gradient_accumulation_steps=tc["gradient_accumulation_steps"],
+        per_device_train_batch_size=tier["per_device_batch"],
+        per_device_eval_batch_size=1,
+        gradient_accumulation_steps=tier["gradient_accumulation"],
         learning_rate=tc["learning_rate"],
         lr_scheduler_type=tc["lr_scheduler_type"],
         warmup_ratio=tc["warmup_ratio"],
@@ -160,31 +287,54 @@ def main():
         eval_steps=tc["eval_steps"],
         eval_strategy="steps",
         save_total_limit=tc["save_total_limit"],
-        bf16=tc["bf16"],
+        bf16=True,
+        fp16=False,
         dataloader_num_workers=tc["dataloader_num_workers"],
-        remove_unused_columns=tc["remove_unused_columns"],
-        report_to=tc["report_to"],
-        dataset_text_field="",  # we handle tokenization ourselves
-        max_seq_length=dc["max_seq_length"],
+        remove_unused_columns=False,
+        report_to=tc.get("report_to", "none"),
+        load_best_model_at_end=True,
+        metric_for_best_model="f1",
+        greater_is_better=True,
+        deepspeed=args.deepspeed,
+        # Gradient checkpointing saves memory at slight speed cost
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
     )
 
-    trainer = SFTTrainer(
+    # ── Trainer ──────────────────────────────────────────────────────────────
+    from transformers import Trainer
+    import functools
+
+    trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        processing_class=processor.tokenizer,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+        data_collator=collate_fn,
+        compute_metrics=functools.partial(compute_metrics, processor=processor),
     )
 
-    # ── Train ──────────────────────────────────────────────────────────────
-    print("Starting training...")
+    # ── Train ─────────────────────────────────────────────────────────────────
+    print(f"Starting training (tier={args.gpu_tier})...")
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
 
-    # ── Save ──────────────────────────────────────────────────────────────
-    print(f"Saving model to {tc['output_dir']}")
-    trainer.save_model(tc["output_dir"])
-    processor.save_pretrained(tc["output_dir"])
-    print("Fine-tuning complete.")
+    # ── Save adapter ──────────────────────────────────────────────────────────
+    print(f"Saving LoRA adapter to: {output_dir}")
+    model.save_pretrained(output_dir)
+    processor.save_pretrained(output_dir)
+
+    # Save tier info for loading
+    with open(os.path.join(output_dir, "training_info.json"), "w") as f:
+        json.dump({
+            "gpu_tier": args.gpu_tier,
+            "lora_r": tier["lora_r"],
+            "base_model": model_name,
+            "use_4bit": tier["use_4bit"],
+        }, f, indent=2)
+
+    print(f"\nFine-tuning complete. Adapter saved to: {output_dir}")
+    print(f"Next step — merge weights for clean inference:")
+    print(f"  python scripts/merge_adapter.py --adapter {output_dir} --output {output_dir}_merged")
 
 
 if __name__ == "__main__":
