@@ -7,6 +7,7 @@ Detects unauthorized inserted frames in videos — short promotional bursts (≥
 ## Problem
 
 At 30 fps, a 300 ms insertion = **9 consecutive frames**. These are:
+
 - Invisible during normal playback
 - Visible when paused — a common vector for smuggling unapproved promotional content
 - Detectable by their **block of high consecutive pHash distances** followed by a return to normal content
@@ -69,7 +70,7 @@ Input Video
 
 ## Project Structure
 
-```
+```text
 VLM/
 ├── video_input/              # Drop any video here for auto-detection
 ├── reports/                  # HTML + JSON output reports
@@ -156,6 +157,7 @@ python scripts/build_dataset.py
 Output: `data/dataset/{train,val,test}/annotations.jsonl`
 
 Each JSONL record is a chat-format sample:
+
 ```json
 {
   "messages": [
@@ -174,7 +176,7 @@ Each JSONL record is a chat-format sample:
 ### GPU tier selection
 
 | Flag | GPU | Config | Notes |
-|------|-----|--------|-------|
+| --- | --- | --- | --- |
 | `--gpu_tier a100` | A100 80GB / H100 | bf16, LoRA r=64, batch=8 | Recommended |
 | `--gpu_tier h100` | H100 80GB | bf16, LoRA r=128, batch=8 | Max quality |
 | `--gpu_tier a100_4bit` | A100 40GB or multi-GPU | QLoRA 4-bit, LoRA r=16 | Memory-constrained |
@@ -211,6 +213,7 @@ Training metrics tracked: **precision**, **recall**, **F1** on the val set.
 Best checkpoint (highest F1) is saved automatically.
 
 The adapter is saved to `models/qwen_ad_detector/` with:
+
 - `adapter_config.json` — LoRA config
 - `adapter_model.safetensors` — trained weights
 - `training_info.json` — tier + base model used
@@ -271,6 +274,7 @@ python main.py --video path/to/video.mp4 --use_finetuned
 
 The classifier auto-detects which mode to use based on whether
 `adapter_config.json` is present in the path:
+
 - **Adapter dir** → loads base model + applies LoRA weights via PEFT
 - **Merged dir** → loads directly as a standalone model
 
@@ -281,7 +285,7 @@ The classifier auto-detects which mode to use based on whether
 ### Detection thresholds (`configs/pipeline_config.yaml`)
 
 | Parameter | Default | Effect |
-|-----------|---------|--------|
+| --- | --- | --- |
 | `phash_threshold` | 25 | Min consecutive pHash distance to flag a frame |
 | `scene_cut_threshold` | 80 | A-X-A distance above which = hard scene cut |
 | `min_segment_frames` | 5 | ~167ms minimum at 30fps |
@@ -296,7 +300,7 @@ The classifier auto-detects which mode to use based on whether
 Key fields — override per GPU tier via `--gpu_tier` flag:
 
 | Parameter | a100 | h100 | a100_4bit |
-|-----------|------|------|-----------|
+| --- | --- | --- | --- |
 | LoRA r | 64 | 128 | 16 |
 | batch (effective) | 8 | 8 | 8 |
 | quantization | none | none | 4-bit NF4 |
