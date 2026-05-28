@@ -1,0 +1,87 @@
+# Fine-tuning Configuration for Qwen2.5-VL-7B-Instruct
+
+model:
+  name: "Qwen/Qwen2.5-VL-7B-Instruct"
+  use_4bit: true
+  bnb_4bit_compute_dtype: "bfloat16"
+  bnb_4bit_quant_type: "nf4"
+  use_nested_quant: true
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  # Also fine-tune vision encoder projection layers
+  vision_modules:
+    - "visual.merger.mlp"
+    - "visual.merger.ln_q"
+
+training:
+  output_dir: "./models/qwen_ad_detector"
+  num_train_epochs: 5
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8   # Effective batch = 8
+  learning_rate: 2.0e-4
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  logging_steps: 10
+  save_steps: 100
+  eval_steps: 100
+  save_total_limit: 3
+  bf16: true
+  dataloader_num_workers: 4
+  remove_unused_columns: false
+  report_to: "none"               # Set "wandb" if you want tracking
+
+dataset:
+  train_file: "./data/dataset/train/annotations.jsonl"
+  val_file: "./data/dataset/val/annotations.jsonl"
+  test_file: "./data/dataset/test/annotations.jsonl"
+  max_seq_length: 1024
+  image_max_pixels: 1003520        # ~1M pixels max per image tile
+
+# Prompt template for fine-tuning
+prompt:
+  system: |
+    You are a video content moderation assistant. Your task is to detect
+    unauthorized inserted frames in videos — short sequences injected by
+    creators to show promotional content, advertisements, or sponsored
+    material that violates platform policies.
+
+    You will be shown a contact sheet with three rows of frames:
+    - TOP ROW: frames BEFORE the suspicious segment (normal content context)
+    - MIDDLE ROW: the SUSPICIOUS frames to analyze
+    - BOTTOM ROW: frames AFTER the suspicious segment (normal content context)
+
+    Subtitle text from each section is shown below the sheet.
+
+    Respond ONLY with valid JSON.
+
+  user_template: |
+    Analyze the contact sheet for inserted promotional frames.
+
+    Subtitle context:
+    - Before: {subtitle_before}
+    - During: {subtitle_during}
+    - After: {subtitle_after}
+
+    Temporal anomaly score: {temporal_score:.3f}
+    Segment duration: {duration_ms}ms ({num_frames} frames)
+
+    Respond with JSON:
+    {{
+      "label": "ad_insertion" | "normal",
+      "confidence": <float 0.0-1.0>,
+      "detected_elements": [<list of strings>],
+      "reason": "<one sentence explanation>"
+    }}

@@ -1,0 +1,46 @@
+# Pipeline Configuration
+
+video:
+  target_fps: 30              # Extract at full video FPS
+  min_fps: 24                 # Minimum acceptable FPS (warn if lower)
+  frame_format: "jpg"
+  frame_quality: 95           # JPEG quality for extracted frames
+
+anomaly_detection:
+  method: "phash"             # phash | ssim | embedding
+  phash_hash_size: 16         # pHash grid size (16x16 = 256-bit hash)
+  phash_threshold: 25         # Hamming distance threshold (0–256); >25 = anomalous
+  context_window: 15          # Frames before/after to compare for A-X-A pattern
+  min_segment_frames: 5       # Minimum frames for a valid suspicious segment (~167ms @ 30fps)
+  max_segment_frames: 90      # Maximum frames (~3s @ 30fps)
+  merge_gap_frames: 10        # Merge two segments if gap < this many frames
+  scene_cut_threshold: 80     # pHash distance above this = hard scene cut (not insertion)
+
+contact_sheet:
+  context_frames: 3           # Frames to show before and after suspicious segment
+  max_anomaly_frames: 5       # Max anomaly frames shown in center row (pick most different)
+  tile_width: 320
+  tile_height: 180
+  border_px: 4
+  font_size: 14
+  subtitle_strip_height: 60   # Height of subtitle text area below sheet
+
+classifier:
+  model_path: "Qwen/Qwen2.5-VL-7B-Instruct"  # Base or fine-tuned path
+  finetuned_path: "./models/qwen_ad_detector"  # Override with fine-tuned when available
+  use_finetuned: false        # Set true after fine-tuning
+  max_new_tokens: 256
+  temperature: 0.1            # Low temp for structured output
+  use_4bit: true              # QLoRA 4-bit quantization for inference
+  batch_size: 1
+
+scoring:
+  temporal_weight: 0.35       # Weight of temporal anomaly score
+  vlm_weight: 0.65            # Weight of VLM classifier confidence
+  decision_threshold: 0.55    # Final score >= this → flagged as insertion
+
+report:
+  output_dir: "./reports"
+  include_contact_sheets: true
+  include_timeline_plot: true
+  format: "html"              # html | json | both
