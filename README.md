@@ -99,7 +99,7 @@ The system combines two independent signals — a fast frame-difference check an
 
 Every frame is compressed into a 256-bit **perceptual hash** (pHash). The Hamming distance between consecutive hashes measures how much the image changed frame-to-frame.
 
-```
+```text
 Normal video:   d[i] = hamming(frame[i], frame[i-1])  →  < 25  (similar scene)
 Ad injection:   d[i] spikes to 80–200 for a block of 9–90 frames
 Scene cut:      single spike, duration < min_segment_frames  →  excluded
@@ -123,7 +123,7 @@ Key thresholds in `configs/pipeline_config.yaml`:
 
 For each suspicious segment the pipeline assembles a **contact sheet** — a 3-row grid image that gives the VLM both the anomalous frames and temporal context:
 
-```
+```text
 ┌──────────────────────────────────────────┐
 │  ROW 1 (green border) — BEFORE context   │  ← 3 normal frames before the segment
 ├──────────────────────────────────────────┤
@@ -196,7 +196,7 @@ The system prompt instructs the model to use the green-border rows as reference 
 
 The two signals are combined into a single final score:
 
-```
+```text
 final_score = 0.35 × temporal_score + 0.65 × vlm_confidence
 is_flagged  = final_score ≥ 0.55
 ```
