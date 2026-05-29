@@ -1,0 +1,28 @@
+# Model weights (too large for GitHub)
+models/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Data and generated files
+data/raw_videos/
+data/synthetic/
+data/ad_frames/
+
+# Reports and frame cache
+reports/
+frame_cache/
+video_input/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
