@@ -604,6 +604,28 @@ Output reports:
 
 ---
 
+## Demo Detection
+
+Run the fine-tuned model on one of the synthetic injected videos generated during dataset creation:
+
+```bash
+mkdir -p video_input
+cp data/synthetic/videos/nature_doc_injected.mp4 video_input/
+python main.py --video video_input/nature_doc_injected.mp4 --use_finetuned
+```
+
+Result — 3/3 ad segments correctly detected:
+
+| Segment | Time | Duration | Final Score |
+| --- | --- | --- | --- |
+| 1 | 5.93s – 6.40s | 467ms | 0.967 ✅ |
+| 2 | 12.33s – 13.33s | 1000ms | 0.844 ✅ |
+| 3 | 16.37s – 17.17s | 800ms | 0.967 ✅ |
+
+Reports saved to `reports/nature_doc_injected/`.
+
+---
+
 ## Running Detection on Real Videos
 
 ### Single video
