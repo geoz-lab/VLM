@@ -587,7 +587,7 @@ python test_run.py
 
 ### Expected output
 
-```
+```text
 ╭─────────────────────────────────────────────╮
 │  VLM Ad Insertion Detector — Test Run        │
 │  VLM step mocked (no GPU required)           │
