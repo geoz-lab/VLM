@@ -11,7 +11,7 @@ Detects unauthorized inserted frames in videos — short promotional bursts (≥
 3. [Detection Logic — How It Works](#detection-logic--how-it-works)
 4. [Project Structure](#project-structure)
 5. [Environment Setup](#environment-setup)
-6. [Sherlock (Stanford HPC) Setup](#sherlock-stanford-hpc-setup)
+6. [HPC Cluster Setup](#hpc-cluster-setup)
 7. [Creating the Dataset](#creating-the-dataset)
 8. [Fine-Tuning](#fine-tuning)
 9. [Saving and Merging Weights](#saving-and-merging-weights)
@@ -299,21 +299,21 @@ pip install flash-attn --no-build-isolation
 
 ---
 
-## Sherlock (Stanford HPC) Setup
+## HPC Cluster Setup
 
-Repo lives at `/home/groups/kovscek/gmzhang/VLM/VLM-main`.
-Conda env lives at `/home/groups/kovscek/gmzhang/miniconda3/envs/vlm`.
+Repo lives at `/home/groups/<group>/<username>/VLM/VLM-main`.
+Conda env lives at `/home/groups/<group>/<username>/miniconda3/envs/vlm`.
 
 ### Every new login session
 
 ```bash
-ssh gmzhang@login.sherlock.stanford.edu
+ssh <username>@<hpc-login-node>
 tmux new -s vlm   # or: tmux attach -t vlm
 
-cd /home/groups/kovscek/gmzhang/VLM/VLM-main
-source /home/groups/kovscek/gmzhang/miniconda3/etc/profile.d/conda.sh
+cd /home/groups/<group>/<username>/VLM/VLM-main
+source /home/groups/<group>/<username>/miniconda3/etc/profile.d/conda.sh
 conda activate vlm
-export PATH="/home/groups/kovscek/gmzhang/miniconda3/envs/vlm/bin:$PATH"
+export PATH="/home/groups/<group>/<username>/miniconda3/envs/vlm/bin:$PATH"
 ```
 
 ### Request an interactive A100 GPU
@@ -322,20 +322,20 @@ Run this from the login node:
 
 ```bash
 srun --ntasks=1 -G 1 --mem-per-cpu=64g --time=6:00:00 \
-  --partition=serc --constraint="GPU_SKU:A100_SXM4" --pty bash
+  --partition=<partition> --constraint="GPU_SKU:A100_SXM4" --pty bash
 ```
 
 After landing on the compute node, re-activate the environment and load CUDA:
 
 ```bash
-source /home/groups/kovscek/gmzhang/miniconda3/etc/profile.d/conda.sh
+source /home/groups/<group>/<username>/miniconda3/etc/profile.d/conda.sh
 conda activate vlm
-export PATH="/home/groups/kovscek/gmzhang/miniconda3/envs/vlm/bin:$PATH"
+export PATH="/home/groups/<group>/<username>/miniconda3/envs/vlm/bin:$PATH"
 module load cuda/12.1.1
 export CUDA_HOME=$CUDA_DIR
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-cd /home/groups/kovscek/gmzhang/VLM/VLM-main
+cd /home/groups/<group>/<username>/VLM/VLM-main
 ```
 
 > These env vars suppress tokenizer warnings and enable PyTorch's memory-efficient allocator, which matters on A100s with large batches.
