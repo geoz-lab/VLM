@@ -8,18 +8,20 @@ Detects unauthorized inserted frames in videos — short promotional bursts (≥
 
 1. [Problem](#problem)
 2. [Detection Pipeline](#detection-pipeline)
-3. [Project Structure](#project-structure)
-4. [Environment Setup](#environment-setup)
-5. [Sherlock (Stanford HPC) Setup](#sherlock-stanford-hpc-setup)
-6. [Creating the Dataset](#creating-the-dataset)
-7. [Fine-Tuning](#fine-tuning)
-8. [Saving and Merging Weights](#saving-and-merging-weights)
-9. [Running Inference with Fine-Tuned Weights](#running-inference-with-fine-tuned-weights)
-10. [Running a Test (No GPU Required)](#running-a-test-no-gpu-required)
-11. [Running Detection on Real Videos](#running-detection-on-real-videos)
-12. [Configuration Reference](#configuration-reference)
-13. [Output Report Format](#output-report-format)
-14. [Subtitle Integration](#subtitle-integration)
+3. [Detection Logic — How It Works](#detection-logic--how-it-works)
+4. [Project Structure](#project-structure)
+5. [Environment Setup](#environment-setup)
+6. [Sherlock (Stanford HPC) Setup](#sherlock-stanford-hpc-setup)
+7. [Creating the Dataset](#creating-the-dataset)
+8. [Fine-Tuning](#fine-tuning)
+9. [Saving and Merging Weights](#saving-and-merging-weights)
+10. [Running Inference with Fine-Tuned Weights](#running-inference-with-fine-tuned-weights)
+11. [Running a Test (No GPU Required)](#running-a-test-no-gpu-required)
+12. [Demo Detection](#demo-detection)
+13. [Running Detection on Real Videos](#running-detection-on-real-videos)
+14. [Configuration Reference](#configuration-reference)
+15. [Output Report Format](#output-report-format)
+16. [Subtitle Integration](#subtitle-integration)
 
 ---
 
@@ -84,6 +86,129 @@ Input Video
        → reports/<video>/<video>_report.html  (visual, embedded contact sheets + timeline)
        → reports/<video>/<video>_report.json  (machine-readable)
 ```
+
+---
+
+## Detection Logic — How It Works
+
+The system combines two independent signals — a fast frame-difference check and a slow visual language model — to catch ad bursts while suppressing false alarms from normal scene cuts.
+
+---
+
+### Stage 1 — Temporal Anomaly Detection (pHash)
+
+Every frame is compressed into a 256-bit **perceptual hash** (pHash). The Hamming distance between consecutive hashes measures how much the image changed frame-to-frame.
+
+```
+Normal video:   d[i] = hamming(frame[i], frame[i-1])  →  < 25  (similar scene)
+Ad injection:   d[i] spikes to 80–200 for a block of 9–90 frames
+Scene cut:      single spike, duration < min_segment_frames  →  excluded
+```
+
+A suspicious segment is any contiguous block of frames where the pHash distance stays above threshold for at least 5 frames (~167 ms at 30 fps) and at most 90 frames (~3 s). Nearby blocks are merged if they are within `merge_gap_frames` of each other. This gives a **temporal score** (0–1) based on how far the mean distance exceeds the threshold.
+
+Key thresholds in `configs/pipeline_config.yaml`:
+
+| Parameter | Default | What it controls |
+| --- | --- | --- |
+| `phash_threshold` | 25 | Minimum distance to flag a frame as anomalous |
+| `scene_cut_threshold` | 80 | Distance above which = hard cut, not insertion |
+| `min_segment_frames` | 5 | Shortest injection that can be detected (~167ms) |
+| `max_segment_frames` | 90 | Longest injection before it's treated as scene change |
+| `merge_gap_frames` | 10 | Gap within which two flagged blocks are merged |
+
+---
+
+### Stage 2 — Contact Sheet Construction
+
+For each suspicious segment the pipeline assembles a **contact sheet** — a 3-row grid image that gives the VLM both the anomalous frames and temporal context:
+
+```
+┌──────────────────────────────────────────┐
+│  ROW 1 (green border) — BEFORE context   │  ← 3 normal frames before the segment
+├──────────────────────────────────────────┤
+│  ROW 2 (red border)   — SUSPICIOUS       │  ← up to 5 most-different frames
+├──────────────────────────────────────────┤
+│  ROW 3 (green border) — AFTER context    │  ← 3 normal frames after the segment
+└──────────────────────────────────────────┘
+│  Subtitle: BEFORE | DURING | AFTER       │
+└──────────────────────────────────────────┘
+```
+
+The before/after rows let the model compare content continuity. If the middle row is visually unrelated to the surrounding content AND matches known ad archetypes (bright gradients, logos, QR codes, price tags, CTAs), the model flags it.
+
+**Example 1 — Nature documentary injection** (temporal score 1.000, flagged ✅)
+
+The before/after rows show consistent golden sandy footage; the red-bordered middle row contains a QR code, a gradient promotional banner, and a bright colour-field frame — impossible to confuse with nature content.
+
+![Nature doc injection](data/dataset/sheets/nature_doc_injected/pos_0000.jpg)
+
+---
+
+**Example 2 — Sports broadcast injection** (temporal score 0.666, flagged ✅)
+
+The before/after rows show a soccer pitch; the middle row abruptly switches to a QR-code frame, a text promo, a product placeholder, and a brand banner before returning to the match.
+
+![Sports injection](data/dataset/sheets/sports_injected/neg_0000.jpg)
+
+---
+
+**Example 3 — Subtle tutorial injection** (temporal score 0.423, flagged ✅)
+
+Harder case: the suspicious segment begins with several frames that look like normal tutorial slides, and only the final frames in the middle row switch to a promotional banner. The lower temporal score reflects this — the pHash distance spiked only at the end. The VLM still flags it because it sees the promotional frame in context of the surrounding tutorial slides.
+
+![Tutorial injection](data/dataset/sheets/tutorial_injected/pos_0000.jpg)
+
+---
+
+**Example 4 — Talking-head broadcast injection** (temporal score 1.000, flagged ✅)
+
+A news/podcast-style talking-head format. The before/after rows show a consistent presenter silhouette; the middle row explodes into bright gradient promos, QR codes, and product shots — maximum visual discontinuity.
+
+![Talking head injection](data/dataset/sheets/talking_head_injected/neg_0001.jpg)
+
+---
+
+### Stage 3 — VLM Classification (Qwen2.5-VL-7B-Instruct)
+
+The contact sheet image is passed to Qwen2.5-VL together with:
+
+- The subtitle text for the before / during / after windows (if available)
+- The temporal anomaly score
+- Segment duration in ms and frame count
+
+The model is prompted to return a structured JSON response:
+
+```json
+{
+  "label": "ad_insertion",
+  "confidence": 0.94,
+  "detected_elements": ["QR code", "promotional text", "brand logo"],
+  "reason": "Middle frames contain branded promotional content inconsistent with surrounding nature footage."
+}
+```
+
+The system prompt instructs the model to use the green-border rows as reference for what "normal" looks like, and to identify ad-specific visual elements (logos, QR codes, price tags, gradient banners, CTA buttons) in the red-border row.
+
+---
+
+### Stage 4 — Score Fusion
+
+The two signals are combined into a single final score:
+
+```
+final_score = 0.35 × temporal_score + 0.65 × vlm_confidence
+is_flagged  = final_score ≥ 0.55
+```
+
+The VLM carries more weight (0.65) because it understands content; the temporal signal (0.35) acts as a fast pre-filter and sanity check. A segment needs both signals to agree to be flagged — a high-pHash spike alone (e.g. a bright camera flash) will not be flagged if the VLM sees nothing promotional, and a confident VLM prediction cannot flag a segment that the temporal detector never surfaced.
+
+| Temporal score | VLM confidence | Final score | Decision |
+| --- | --- | --- | --- |
+| 1.000 | 0.940 | 0.961 | Flagged ✅ |
+| 0.423 | 0.850 | 0.702 | Flagged ✅ |
+| 0.800 | 0.300 | 0.475 | Cleared ✗ |
+| 0.150 | 0.600 | 0.443 | Cleared ✗ |
 
 ---
 
