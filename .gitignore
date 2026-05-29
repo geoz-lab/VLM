@@ -1,19 +1,27 @@
 # Model weights (too large for GitHub)
-models/
+models/*
+!models/.gitkeep
 *.safetensors
 *.bin
 *.pt
 *.pth
 
 # Data and generated files
-data/raw_videos/
-data/synthetic/
-data/ad_frames/
+data/raw_videos/*
+!data/raw_videos/.gitkeep
+data/synthetic/videos/*
+!data/synthetic/videos/.gitkeep
+data/synthetic/annotations/*
+!data/synthetic/annotations/.gitkeep
+data/ad_frames/*
+!data/ad_frames/.gitkeep
 
 # Reports and frame cache
-reports/
+reports/*
+!reports/.gitkeep
 frame_cache/
-video_input/
+video_input/*
+!video_input/.gitkeep
 
 # Python
 __pycache__/
